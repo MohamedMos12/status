@@ -1,0 +1,138 @@
+# اسم سير العمل الذي سيظهر في واجهة GitHub Actions
+name: "Subdomain Analyzer"
+
+# تحديد متى يتم تشغيل هذا السير العمل
+# هنا قمنا بتحديده للتشغيل اليدوي فقط
+on:
+  workflow_dispatch:
+
+# تعريف المهام (Jobs) التي سيتم تنفيذها
+jobs:
+  scan-subdomains:
+    # اسم المهمة
+    name: "Scanning and Analyzing Subdomains"
+    
+    # تحديد نوع البيئة التي ستعمل عليها المهمة
+    runs-on: ubuntu-latest
+
+    # الخطوات التي ستتم تنفيذها في المهمة
+    steps:
+      # الخطوة 1: سحب الكود من المستودع
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # الخطوة 2: تثبيت الأدوات اللازمة (asnmap و jq)
+      - name: Install Dependencies
+        run: |
+          echo "Installing asnmap..."
+          # تحميل أحدث إصدار من asnmap
+          wget https://github.com/projectdiscovery/asnmap/releases/latest/download/asnmap_1.0.6_linux_amd64.zip
+          unzip asnmap_1.0.6_linux_amd64.zip
+          sudo mv asnmap /usr/local/bin/
+          sudo chmod +x /usr/local/bin/asnmap
+          # تثبيت jq لمعالجة ملفات JSON
+          sudo apt-get update && sudo apt-get install -y jq
+
+      # الخطوة 3: تنفيذ السكربت الرئيسي للفحص
+      - name: Run Analysis Script
+        run: |
+          # إعداد ملفات المخرجات
+          > asn_info.txt
+          > results_2xx.txt
+          > results_3xx.txt
+          > results_4xx.txt
+          > results_404.txt
+          > cname_info.txt
+
+          echo "Starting analysis for subdomains in subdomains.txt..."
+          
+          # المرور على كل نطاق فرعي في الملف
+          while IFS= read -r subdomain; do
+            echo "--------------------------------------------------"
+            echo "Processing: $subdomain"
+
+            # 1. البحث عن عنوان IP
+            ip=$(dig +short "$subdomain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+
+            if [ -n "$ip" ]; then
+              echo "  [+] IP Found: $ip"
+
+              # 2. البحث عن ASN و نطاق IP
+              asn_data=$(asnmap -ip "$ip" -json)
+              if [ -n "$asn_data" ] && [ "$asn_data" != "null" ]; then
+                asn=$(echo "$asn_data" | jq -r '.[0].asn // "N/A"')
+                cidr=$(echo "$asn_data" | jq -r '.[0].cidr // "N/A"')
+                echo "  [+] ASN: $asn | Range: $cidr"
+                echo "$subdomain,$ip,$asn,$cidr" >> asn_info.txt
+              else
+                echo "  [-] ASN/Range not found for IP $ip"
+                echo "$subdomain,$ip,N/A,N/A" >> asn_info.txt
+              fi
+            else
+              echo "  [-] Could not resolve IP for $subdomain"
+              echo "$subdomain,N/A,N/A,N/A" >> asn_info.txt
+            fi
+
+            # 3. البحث عن CNAME
+            cname=$(dig +short "$subdomain" CNAME)
+            if [ -n "$cname" ]; then
+              echo "  [+] CNAME: $cname"
+              echo "$subdomain,$cname" >> cname_info.txt
+            else
+              echo "  [-] No CNAME found."
+              echo "$subdomain,N/A" >> cname_info.txt
+            fi
+
+            # 4. فحص كود الحالة والعنوان (Title)
+            # نحاول أولاً HTTPS ثم HTTP كخيار احتياطي
+            url="https://$subdomain"
+            status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url")
+            
+            # إذا فشل HTTPS (مثلاً خطأ في الشهادة)، جرب HTTP
+            if [ "$status_code" -eq 000 ]; then
+              url="http://$subdomain"
+              status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url")
+            fi
+
+            if [ "$status_code" -ne 000 ]; then
+              title=$(curl -s -L --max-time 10 "$url" | grep -oP '<title>\K.*(?=</title>)' | head -n 1)
+              if [ -z "$title" ]; then
+                title="N/A"
+              fi
+              echo "  [+] Status: $status_code | Title: $title"
+
+              # 5. حفظ النتائج حسب كود الحالة
+              if [[ "$status_code" =~ ^2[0-9]{2}$ ]]; then
+                echo "$subdomain | $status_code | $title" >> results_2xx.txt
+              elif [[ "$status_code" =~ ^3[0-9]{2}$ ]]; then
+                echo "$subdomain | $status_code | $title" >> results_3xx.txt
+              elif [[ "$status_code" =~ ^4[0-9]{2}$ ]]; then
+                echo "$subdomain | $status_code | $title" >> results_4xx.txt
+                # حفظ 404 في ملف منفصل
+                if [ "$status_code" == "404" ]; then
+                  echo "$subdomain | $status_code | $title" >> results_404.txt
+                fi
+              elif [[ "$status_code" =~ ^5[0-9]{2}$ ]]; then
+                echo "$subdomain | $status_code | $title" >> results_5xx.txt # ملف إضافي للأخطاء الخادمية
+              fi
+            else
+              echo "  [-] Could not connect to $subdomain"
+            fi
+
+          done < subdomains.txt
+          
+          echo "--------------------------------------------------"
+          echo "Analysis complete. Check the generated files."
+
+      # الخطوة 4: رفع الملفات الناتجة كـ "Artifacts" لتنزيلها بسهولة
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: |
+            asn_info.txt
+            results_2xx.txt
+            results_3xx.txt
+            results_4xx.txt
+            results_404.txt
+            cname_info.txt
