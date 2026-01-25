@@ -1,87 +1,71 @@
-# اسم سير العمل الذي سيظهر في واجهة GitHub Actions
 name: "Subdomain Analyzer"
 
-# تحديد متى يتم تشغيل هذا السير العمل
-# هنا قمنا بتحديده للتشغيل اليدوي فقط
 on:
   workflow_dispatch:
 
-# تعريف المهام (Jobs) التي سيتم تنفيذها
 jobs:
   scan-subdomains:
-    # اسم المهمة
     name: "Scanning and Analyzing Subdomains"
-    
-    # تحديد نوع البيئة التي ستعمل عليها المهمة
     runs-on: ubuntu-latest
 
-    # الخطوات التي ستتم تنفيذها في المهمة
     steps:
-      # الخطوة 1: سحب الكود من المستودع
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # الخطوة 2: تثبيت الأدوات اللازمة (asnmap و jq)
-        # الخطوة 2: تثبيت الأدوات اللازمة (asnmap و jq)
       - name: Install Dependencies
         run: |
-          echo "Installing jq..."
-          sudo apt-get update && sudo apt-get install -y jq curl unzip
-
-          echo "Installing the latest version of asnmap..."
-          # الحصول على أحدث إصدار من asnmap باستخدام GitHub API
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/projectdiscovery/asnmap/releases/latest | jq -r '.tag_name')
-          echo "Latest release found: $LATEST_RELEASE"
+          sudo apt-get update && sudo apt-get install -y jq curl unzip dnsutils
           
-          # بناء رابط التحميل ديناميكيًا
-          # نزيل الحرف 'v' من اسم الإصدار ليتوافق مع اسم الملف
+          echo "Installing asnmap..."
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/projectdiscovery/asnmap/releases/latest | jq -r '.tag_name')
           VERSION_NUMBER="${LATEST_RELEASE#v}"
           DOWNLOAD_URL="https://github.com/projectdiscovery/asnmap/releases/download/${LATEST_RELEASE}/asnmap_${VERSION_NUMBER}_linux_amd64.zip"
           
-          echo "Downloading from: $DOWNLOAD_URL"
           wget "$DOWNLOAD_URL" -O asnmap.zip
           unzip asnmap.zip
           sudo mv asnmap /usr/local/bin/
           sudo chmod +x /usr/local/bin/asnmap
-          
-          # تنظيف الملفات المؤقتة
           rm asnmap.zip
-          echo "asnmap installed successfully."
 
-      # الخطوة 3: تنفيذ السكربت الرئيسي للفحص
-      # الخطوة 3: تنفيذ السكربت الرئيسي للفحص
       - name: Run Analysis Script
+        env:
+          PDCP_API_KEY: ${{ secrets.PDCP_API_KEY }}
         run: |
-          # إعداد ملفات المخرجات (استخدام touch أفضل من الإفراغ المباشر)
+          # تجهيز الملفات
           touch asn_info.txt results_2xx.txt results_3xx.txt results_4xx.txt results_404.txt results_5xx.txt cname_info.txt
 
-          # التأكد من وجود ملف المدخلات
+          # التحقق من وجود المفتاح
+          if [ -z "$PDCP_API_KEY" ]; then
+            echo "Error: PDCP_API_KEY is missing. Please add it to GitHub Secrets."
+            exit 1
+          fi
+
+          # التحقق من وجود ملف المدخلات
           if [ ! -f subdomains.txt ]; then
             echo "Error: subdomains.txt not found!"
             exit 1
           fi
 
-          echo "Starting analysis for subdomains..."
+          echo "Starting analysis..."
           
-          # قراءة الملف سطراً بسطر مع تجاهل الأسطر الفارغة
           while IFS= read -r line || [ -n "$line" ]; do
-            # تنظيف السطر من المسافات أو الرموز الغريبة
             subdomain=$(echo "$line" | xargs)
-            
-            # تخطي السطر إذا كان فارغاً تماماً
             [[ -z "$subdomain" ]] && continue
 
             echo "--------------------------------------------------"
             echo "Processing: $subdomain"
 
-            # 1. البحث عن عنوان IP (أضفنا || true لمنع التوقف عند الخطأ)
+            # 1. البحث عن IP
             ip=$(dig +short "$subdomain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
 
             if [ -n "$ip" ]; then
               echo "  [+] IP Found: $ip"
-              # 2. البحث عن ASN
-              asn_data=$(asnmap -ip "$ip" -json || echo "")
-              if [ -n "$asn_data" ] && [ "$asn_data" != "null" ]; then
+              
+              # 2. البحث عن ASN (أضفنا -auth و -silent وتجاهل tty)
+              # نستخدم خيار -auth مباشرة مع الأمر لضمان عدم طلب إدخال يدوي
+              asn_data=$(asnmap -ip "$ip" -json -auth "$PDCP_API_KEY" -silent 2>/dev/null || echo "[]")
+              
+              if echo "$asn_data" | jq -e '. != null and length > 0' >/dev/null 2>&1; then
                 asn=$(echo "$asn_data" | jq -r '.[0].asn // "N/A"')
                 cidr=$(echo "$asn_data" | jq -r '.[0].cidr // "N/A"')
                 echo "  [+] ASN: $asn | Range: $cidr"
@@ -95,11 +79,11 @@ jobs:
               echo "$subdomain,N/A,N/A,N/A" >> asn_info.txt
             fi
 
-            # 3. البحث عن CNAME
-            cname=$(dig +short "$subdomain" CNAME || true)
+            # 3. CNAME
+            cname=$(dig +short "$subdomain" CNAME | head -n 1 || true)
             echo "$subdomain,${cname:-N/A}" >> cname_info.txt
 
-            # 4. فحص كود الحالة
+            # 4. HTTP Status
             url="https://$subdomain"
             status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url" || echo "000")
             
@@ -112,7 +96,6 @@ jobs:
               title=$(curl -s -L --max-time 10 "$url" | grep -oP '<title>\K.*(?=</title>)' | head -n 1 || echo "N/A")
               echo "  [+] Status: $status_code | Title: $title"
               
-              # توزيع النتائج
               case $status_code in
                 2*) echo "$subdomain | $status_code | $title" >> results_2xx.txt ;;
                 3*) echo "$subdomain | $status_code | $title" >> results_3xx.txt ;;
@@ -122,13 +105,8 @@ jobs:
                 5*) echo "$subdomain | $status_code | $title" >> results_5xx.txt ;;
               esac
             fi
-
           done < subdomains.txt
-          
-          echo "--------------------------------------------------"
-          echo "Analysis complete."
 
-      # الخطوة 4: رفع الملفات الناتجة كـ "Artifacts" لتنزيلها بسهولة
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
@@ -139,4 +117,5 @@ jobs:
             results_3xx.txt
             results_4xx.txt
             results_404.txt
+            results_5xx.txt
             cname_info.txt
