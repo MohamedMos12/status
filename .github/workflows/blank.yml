@@ -22,16 +22,31 @@ jobs:
         uses: actions/checkout@v4
 
       # الخطوة 2: تثبيت الأدوات اللازمة (asnmap و jq)
+        # الخطوة 2: تثبيت الأدوات اللازمة (asnmap و jq)
       - name: Install Dependencies
         run: |
-          echo "Installing asnmap..."
-          # تحميل أحدث إصدار من asnmap
-          wget https://github.com/projectdiscovery/asnmap/releases/latest/download/asnmap_1.0.6_linux_amd64.zip
-          unzip asnmap_1.0.6_linux_amd64.zip
+          echo "Installing jq..."
+          sudo apt-get update && sudo apt-get install -y jq curl unzip
+
+          echo "Installing the latest version of asnmap..."
+          # الحصول على أحدث إصدار من asnmap باستخدام GitHub API
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/projectdiscovery/asnmap/releases/latest | jq -r '.tag_name')
+          echo "Latest release found: $LATEST_RELEASE"
+          
+          # بناء رابط التحميل ديناميكيًا
+          # نزيل الحرف 'v' من اسم الإصدار ليتوافق مع اسم الملف
+          VERSION_NUMBER="${LATEST_RELEASE#v}"
+          DOWNLOAD_URL="https://github.com/projectdiscovery/asnmap/releases/download/${LATEST_RELEASE}/asnmap_${VERSION_NUMBER}_linux_amd64.zip"
+          
+          echo "Downloading from: $DOWNLOAD_URL"
+          wget "$DOWNLOAD_URL" -O asnmap.zip
+          unzip asnmap.zip
           sudo mv asnmap /usr/local/bin/
           sudo chmod +x /usr/local/bin/asnmap
-          # تثبيت jq لمعالجة ملفات JSON
-          sudo apt-get update && sudo apt-get install -y jq
+          
+          # تنظيف الملفات المؤقتة
+          rm asnmap.zip
+          echo "asnmap installed successfully."
 
       # الخطوة 3: تنفيذ السكربت الرئيسي للفحص
       - name: Run Analysis Script
