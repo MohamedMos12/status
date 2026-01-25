@@ -49,95 +49,84 @@ jobs:
           echo "asnmap installed successfully."
 
       # الخطوة 3: تنفيذ السكربت الرئيسي للفحص
+      # الخطوة 3: تنفيذ السكربت الرئيسي للفحص
       - name: Run Analysis Script
         run: |
-          # إعداد ملفات المخرجات
-          > asn_info.txt
-          > results_2xx.txt
-          > results_3xx.txt
-          > results_4xx.txt
-          > results_404.txt
-          > cname_info.txt
+          # إعداد ملفات المخرجات (استخدام touch أفضل من الإفراغ المباشر)
+          touch asn_info.txt results_2xx.txt results_3xx.txt results_4xx.txt results_404.txt results_5xx.txt cname_info.txt
 
-          echo "Starting analysis for subdomains in subdomains.txt..."
+          # التأكد من وجود ملف المدخلات
+          if [ ! -f subdomains.txt ]; then
+            echo "Error: subdomains.txt not found!"
+            exit 1
+          fi
+
+          echo "Starting analysis for subdomains..."
           
-          # المرور على كل نطاق فرعي في الملف
-          while IFS= read -r subdomain; do
+          # قراءة الملف سطراً بسطر مع تجاهل الأسطر الفارغة
+          while IFS= read -r line || [ -n "$line" ]; do
+            # تنظيف السطر من المسافات أو الرموز الغريبة
+            subdomain=$(echo "$line" | xargs)
+            
+            # تخطي السطر إذا كان فارغاً تماماً
+            [[ -z "$subdomain" ]] && continue
+
             echo "--------------------------------------------------"
             echo "Processing: $subdomain"
 
-            # 1. البحث عن عنوان IP
-            ip=$(dig +short "$subdomain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+            # 1. البحث عن عنوان IP (أضفنا || true لمنع التوقف عند الخطأ)
+            ip=$(dig +short "$subdomain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
 
             if [ -n "$ip" ]; then
               echo "  [+] IP Found: $ip"
-
-              # 2. البحث عن ASN و نطاق IP
-              asn_data=$(asnmap -ip "$ip" -json)
+              # 2. البحث عن ASN
+              asn_data=$(asnmap -ip "$ip" -json || echo "")
               if [ -n "$asn_data" ] && [ "$asn_data" != "null" ]; then
                 asn=$(echo "$asn_data" | jq -r '.[0].asn // "N/A"')
                 cidr=$(echo "$asn_data" | jq -r '.[0].cidr // "N/A"')
                 echo "  [+] ASN: $asn | Range: $cidr"
                 echo "$subdomain,$ip,$asn,$cidr" >> asn_info.txt
               else
-                echo "  [-] ASN/Range not found for IP $ip"
+                echo "  [-] ASN/Range not found"
                 echo "$subdomain,$ip,N/A,N/A" >> asn_info.txt
               fi
             else
-              echo "  [-] Could not resolve IP for $subdomain"
+              echo "  [-] Could not resolve IP"
               echo "$subdomain,N/A,N/A,N/A" >> asn_info.txt
             fi
 
             # 3. البحث عن CNAME
-            cname=$(dig +short "$subdomain" CNAME)
-            if [ -n "$cname" ]; then
-              echo "  [+] CNAME: $cname"
-              echo "$subdomain,$cname" >> cname_info.txt
-            else
-              echo "  [-] No CNAME found."
-              echo "$subdomain,N/A" >> cname_info.txt
-            fi
+            cname=$(dig +short "$subdomain" CNAME || true)
+            echo "$subdomain,${cname:-N/A}" >> cname_info.txt
 
-            # 4. فحص كود الحالة والعنوان (Title)
-            # نحاول أولاً HTTPS ثم HTTP كخيار احتياطي
+            # 4. فحص كود الحالة
             url="https://$subdomain"
-            status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url")
+            status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url" || echo "000")
             
-            # إذا فشل HTTPS (مثلاً خطأ في الشهادة)، جرب HTTP
             if [ "$status_code" -eq 000 ]; then
               url="http://$subdomain"
-              status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url")
+              status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url" || echo "000")
             fi
 
             if [ "$status_code" -ne 000 ]; then
-              title=$(curl -s -L --max-time 10 "$url" | grep -oP '<title>\K.*(?=</title>)' | head -n 1)
-              if [ -z "$title" ]; then
-                title="N/A"
-              fi
+              title=$(curl -s -L --max-time 10 "$url" | grep -oP '<title>\K.*(?=</title>)' | head -n 1 || echo "N/A")
               echo "  [+] Status: $status_code | Title: $title"
-
-              # 5. حفظ النتائج حسب كود الحالة
-              if [[ "$status_code" =~ ^2[0-9]{2}$ ]]; then
-                echo "$subdomain | $status_code | $title" >> results_2xx.txt
-              elif [[ "$status_code" =~ ^3[0-9]{2}$ ]]; then
-                echo "$subdomain | $status_code | $title" >> results_3xx.txt
-              elif [[ "$status_code" =~ ^4[0-9]{2}$ ]]; then
-                echo "$subdomain | $status_code | $title" >> results_4xx.txt
-                # حفظ 404 في ملف منفصل
-                if [ "$status_code" == "404" ]; then
-                  echo "$subdomain | $status_code | $title" >> results_404.txt
-                fi
-              elif [[ "$status_code" =~ ^5[0-9]{2}$ ]]; then
-                echo "$subdomain | $status_code | $title" >> results_5xx.txt # ملف إضافي للأخطاء الخادمية
-              fi
-            else
-              echo "  [-] Could not connect to $subdomain"
+              
+              # توزيع النتائج
+              case $status_code in
+                2*) echo "$subdomain | $status_code | $title" >> results_2xx.txt ;;
+                3*) echo "$subdomain | $status_code | $title" >> results_3xx.txt ;;
+                404) echo "$subdomain | $status_code | $title" >> results_404.txt
+                     echo "$subdomain | $status_code | $title" >> results_4xx.txt ;;
+                4*) echo "$subdomain | $status_code | $title" >> results_4xx.txt ;;
+                5*) echo "$subdomain | $status_code | $title" >> results_5xx.txt ;;
+              esac
             fi
 
           done < subdomains.txt
           
           echo "--------------------------------------------------"
-          echo "Analysis complete. Check the generated files."
+          echo "Analysis complete."
 
       # الخطوة 4: رفع الملفات الناتجة كـ "Artifacts" لتنزيلها بسهولة
       - name: Upload Results
