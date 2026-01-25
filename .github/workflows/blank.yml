@@ -1,121 +1,81 @@
-name: "Subdomain Analyzer"
+name: "Fast Subdomain Analyzer"
 
 on:
   workflow_dispatch:
 
 jobs:
-  scan-subdomains:
-    name: "Scanning and Analyzing Subdomains"
+  fast-scan:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Install Dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y jq curl unzip dnsutils
+          sudo apt-get update && sudo apt-get install -y jq curl unzip parallel dnsutils
           
+          # Install httpx (for fast HTTP status checks)
+          echo "Installing httpx..."
+          wget https://github.com/projectdiscovery/httpx/releases/latest/download/httpx_amd64.zip -O httpx.zip
+          unzip httpx.zip
+          sudo mv httpx /usr/local/bin/
+          sudo chmod +x /usr/local/bin/
+          rm httpx.zip
+
+          # Install asnmap (same كما عندك)
           echo "Installing asnmap..."
           LATEST_RELEASE=$(curl -s https://api.github.com/repos/projectdiscovery/asnmap/releases/latest | jq -r '.tag_name')
           VERSION_NUMBER="${LATEST_RELEASE#v}"
           DOWNLOAD_URL="https://github.com/projectdiscovery/asnmap/releases/download/${LATEST_RELEASE}/asnmap_${VERSION_NUMBER}_linux_amd64.zip"
-          
           wget "$DOWNLOAD_URL" -O asnmap.zip
           unzip asnmap.zip
           sudo mv asnmap /usr/local/bin/
           sudo chmod +x /usr/local/bin/asnmap
           rm asnmap.zip
 
-      - name: Run Analysis Script
+      - name: Run Fast Analysis
         env:
           PDCP_API_KEY: ${{ secrets.PDCP_API_KEY }}
         run: |
-          # تجهيز الملفات
-          touch asn_info.txt results_2xx.txt results_3xx.txt results_4xx.txt results_404.txt results_5xx.txt cname_info.txt
-
-          # التحقق من وجود المفتاح
           if [ -z "$PDCP_API_KEY" ]; then
-            echo "Error: PDCP_API_KEY is missing. Please add it to GitHub Secrets."
+            echo "Error: PDCP_API_KEY is missing"
             exit 1
           fi
 
-          # التحقق من وجود ملف المدخلات
           if [ ! -f subdomains.txt ]; then
-            echo "Error: subdomains.txt not found!"
+            echo "Error: subdomains.txt not found"
             exit 1
           fi
 
-          echo "Starting analysis..."
-          
-          while IFS= read -r line || [ -n "$line" ]; do
-            subdomain=$(echo "$line" | xargs)
-            [[ -z "$subdomain" ]] && continue
+          mkdir -p results
 
-            echo "--------------------------------------------------"
-            echo "Processing: $subdomain"
+          export -f analyze_subdomain
+          analyze_subdomain() {
+            subdomain="$1"
+            [[ -z "$subdomain" ]] && return
 
-            # 1. البحث عن IP
-            ip=$(dig +short "$subdomain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+            ip=$(dig +short "$subdomain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || echo "N/A")
+            echo "$subdomain,$ip" >> results/asn_info.txt
 
-            if [ -n "$ip" ]; then
-              echo "  [+] IP Found: $ip"
-              
-              # 2. البحث عن ASN (أضفنا -auth و -silent وتجاهل tty)
-              # نستخدم خيار -auth مباشرة مع الأمر لضمان عدم طلب إدخال يدوي
+            if [ "$ip" != "N/A" ]; then
               asn_data=$(asnmap -ip "$ip" -json -auth "$PDCP_API_KEY" -silent 2>/dev/null || echo "[]")
-              
-              if echo "$asn_data" | jq -e '. != null and length > 0' >/dev/null 2>&1; then
-                asn=$(echo "$asn_data" | jq -r '.[0].asn // "N/A"')
-                cidr=$(echo "$asn_data" | jq -r '.[0].cidr // "N/A"')
-                echo "  [+] ASN: $asn | Range: $cidr"
-                echo "$subdomain,$ip,$asn,$cidr" >> asn_info.txt
-              else
-                echo "  [-] ASN/Range not found"
-                echo "$subdomain,$ip,N/A,N/A" >> asn_info.txt
-              fi
-            else
-              echo "  [-] Could not resolve IP"
-              echo "$subdomain,N/A,N/A,N/A" >> asn_info.txt
+              asn=$(echo "$asn_data" | jq -r '.[0].asn // "N/A"')
+              cidr=$(echo "$asn_data" | jq -r '.[0].cidr // "N/A"')
+              echo "$subdomain,$ip,$asn,$cidr" >> results/asn_info.txt
             fi
 
-            # 3. CNAME
-            cname=$(dig +short "$subdomain" CNAME | head -n 1 || true)
-            echo "$subdomain,${cname:-N/A}" >> cname_info.txt
+            cname=$(dig +short "$subdomain" CNAME | head -n1 || echo "N/A")
+            echo "$subdomain,$cname" >> results/cname_info.txt
+          }
 
-            # 4. HTTP Status
-            url="https://$subdomain"
-            status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url" || echo "000")
-            
-            if [ "$status_code" -eq 000 ]; then
-              url="http://$subdomain"
-              status_code=$(curl -o /dev/null -s -w "%{http_code}" -L --max-time 10 "$url" || echo "000")
-            fi
+          # Parallel DNS & ASN analysis
+          cat subdomains.txt | parallel -j 20 analyze_subdomain {}
 
-            if [ "$status_code" -ne 000 ]; then
-              title=$(curl -s -L --max-time 10 "$url" | grep -oP '<title>\K.*(?=</title>)' | head -n 1 || echo "N/A")
-              echo "  [+] Status: $status_code | Title: $title"
-              
-              case $status_code in
-                2*) echo "$subdomain | $status_code | $title" >> results_2xx.txt ;;
-                3*) echo "$subdomain | $status_code | $title" >> results_3xx.txt ;;
-                404) echo "$subdomain | $status_code | $title" >> results_404.txt
-                     echo "$subdomain | $status_code | $title" >> results_4xx.txt ;;
-                4*) echo "$subdomain | $status_code | $title" >> results_4xx.txt ;;
-                5*) echo "$subdomain | $status_code | $title" >> results_5xx.txt ;;
-              esac
-            fi
-          done < subdomains.txt
+          # Fast HTTP status check with httpx
+          httpx -l subdomains.txt -silent -status-code -title -o results/http_results.txt
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results
-          path: |
-            asn_info.txt
-            results_2xx.txt
-            results_3xx.txt
-            results_4xx.txt
-            results_404.txt
-            results_5xx.txt
-            cname_info.txt
+          name: fast-scan-results
+          path: results/
