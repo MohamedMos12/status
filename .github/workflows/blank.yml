@@ -13,16 +13,19 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y jq curl unzip parallel dnsutils
-          
-          # Install httpx (for fast HTTP status checks)
-          echo "Installing httpx..."
-          wget https://github.com/projectdiscovery/httpx/releases/latest/download/httpx_amd64.zip -O httpx.zip
+
+          # httpx آخر نسخة
+          LATEST_HX=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r '.tag_name')
+          VERSION_NUMBER="${LATEST_HX#v}"
+          DOWNLOAD_URL="https://github.com/projectdiscovery/httpx/releases/download/${LATEST_HX}/httpx_${VERSION_NUMBER}_linux_amd64.zip"
+
+          wget "$DOWNLOAD_URL" -O httpx.zip
           unzip httpx.zip
           sudo mv httpx /usr/local/bin/
-          sudo chmod +x /usr/local/bin/
+          sudo chmod +x /usr/local/bin/httpx
           rm httpx.zip
 
-          # Install asnmap (same كما عندك)
+          # Install asnmap
           echo "Installing asnmap..."
           LATEST_RELEASE=$(curl -s https://api.github.com/repos/projectdiscovery/asnmap/releases/latest | jq -r '.tag_name')
           VERSION_NUMBER="${LATEST_RELEASE#v}"
