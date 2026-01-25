@@ -14,24 +14,22 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y jq curl unzip parallel dnsutils
 
-          # httpx آخر نسخة
+          # Install httpx (latest release)
           LATEST_HX=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r '.tag_name')
           VERSION_NUMBER="${LATEST_HX#v}"
           DOWNLOAD_URL="https://github.com/projectdiscovery/httpx/releases/download/${LATEST_HX}/httpx_${VERSION_NUMBER}_linux_amd64.zip"
-
           wget "$DOWNLOAD_URL" -O httpx.zip
-          unzip httpx.zip
+          unzip -o httpx.zip
           sudo mv httpx /usr/local/bin/
           sudo chmod +x /usr/local/bin/httpx
           rm httpx.zip
 
-          # Install asnmap
-          echo "Installing asnmap..."
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/projectdiscovery/asnmap/releases/latest | jq -r '.tag_name')
-          VERSION_NUMBER="${LATEST_RELEASE#v}"
-          DOWNLOAD_URL="https://github.com/projectdiscovery/asnmap/releases/download/${LATEST_RELEASE}/asnmap_${VERSION_NUMBER}_linux_amd64.zip"
+          # Install asnmap (latest release)
+          LATEST_ASN=$(curl -s https://api.github.com/repos/projectdiscovery/asnmap/releases/latest | jq -r '.tag_name')
+          VERSION_NUMBER="${LATEST_ASN#v}"
+          DOWNLOAD_URL="https://github.com/projectdiscovery/asnmap/releases/download/${LATEST_ASN}/asnmap_${VERSION_NUMBER}_linux_amd64.zip"
           wget "$DOWNLOAD_URL" -O asnmap.zip
-          unzip asnmap.zip
+          unzip -o asnmap.zip
           sudo mv asnmap /usr/local/bin/
           sudo chmod +x /usr/local/bin/asnmap
           rm asnmap.zip
@@ -52,33 +50,43 @@ jobs:
 
           mkdir -p results
 
-          export -f analyze_subdomain
+          # Function to analyze one subdomain
           analyze_subdomain() {
             subdomain="$1"
             [[ -z "$subdomain" ]] && return
 
+            # Resolve IP
             ip=$(dig +short "$subdomain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || echo "N/A")
-            echo "$subdomain,$ip" >> results/asn_info.txt
 
+            # ASN lookup
             if [ "$ip" != "N/A" ]; then
               asn_data=$(asnmap -ip "$ip" -json -auth "$PDCP_API_KEY" -silent 2>/dev/null || echo "[]")
               asn=$(echo "$asn_data" | jq -r '.[0].asn // "N/A"')
               cidr=$(echo "$asn_data" | jq -r '.[0].cidr // "N/A"')
-              echo "$subdomain,$ip,$asn,$cidr" >> results/asn_info.txt
+            else
+              asn="N/A"
+              cidr="N/A"
             fi
 
+            # CNAME lookup
             cname=$(dig +short "$subdomain" CNAME | head -n1 || echo "N/A")
-            echo "$subdomain,$cname" >> results/cname_info.txt
+
+            # HTTP status & title
+            http_info=$(httpx -silent -status-code -title -l <(echo "$subdomain") || echo "000|N/A")
+            status_code=$(echo "$http_info" | awk -F '|' '{print $1}')
+            title=$(echo "$http_info" | awk -F '|' '{print $2}')
+
+            # Save results
+            echo "$subdomain,$ip,$asn,$cidr,$cname,$status_code,$title" >> results/final_results.csv
           }
 
-          # Parallel DNS & ASN analysis
-          cat subdomains.txt | parallel -j 20 analyze_subdomain {}
+          export -f analyze_subdomain
 
-          # Fast HTTP status check with httpx
-          httpx -l subdomains.txt -silent -status-code -title -o results/http_results.txt
+          # Run in parallel
+          cat subdomains.txt | parallel -j 20 analyze_subdomain {}
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
           name: fast-scan-results
-          path: results/
+          path: results/final_results.csv
