@@ -1,10 +1,10 @@
-name: "Fast Subdomain Analyzer"
+name: "Fast HTTPX Subdomain Scan"
 
 on:
   workflow_dispatch:
 
 jobs:
-  fast-scan:
+  httpx-scan:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -12,9 +12,9 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y jq curl unzip parallel dnsutils
+          sudo apt-get update && sudo apt-get install -y wget unzip
 
-          # Install httpx (latest release)
+          # Install httpx latest release
           LATEST_HX=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r '.tag_name')
           VERSION_NUMBER="${LATEST_HX#v}"
           DOWNLOAD_URL="https://github.com/projectdiscovery/httpx/releases/download/${LATEST_HX}/httpx_${VERSION_NUMBER}_linux_amd64.zip"
@@ -24,69 +24,30 @@ jobs:
           sudo chmod +x /usr/local/bin/httpx
           rm httpx.zip
 
-          # Install asnmap (latest release)
-          LATEST_ASN=$(curl -s https://api.github.com/repos/projectdiscovery/asnmap/releases/latest | jq -r '.tag_name')
-          VERSION_NUMBER="${LATEST_ASN#v}"
-          DOWNLOAD_URL="https://github.com/projectdiscovery/asnmap/releases/download/${LATEST_ASN}/asnmap_${VERSION_NUMBER}_linux_amd64.zip"
-          wget "$DOWNLOAD_URL" -O asnmap.zip
-          unzip -o asnmap.zip
-          sudo mv asnmap /usr/local/bin/
-          sudo chmod +x /usr/local/bin/asnmap
-          rm asnmap.zip
-
-      - name: Run Fast Analysis
-        env:
-          PDCP_API_KEY: ${{ secrets.PDCP_API_KEY }}
+      - name: Run HTTPX Scan
         run: |
-          if [ -z "$PDCP_API_KEY" ]; then
-            echo "Error: PDCP_API_KEY is missing"
-            exit 1
-          fi
-
           if [ ! -f subdomains.txt ]; then
-            echo "Error: subdomains.txt not found"
+            echo "Error: subdomains.txt not found!"
             exit 1
           fi
 
           mkdir -p results
 
-          # Function to analyze one subdomain
-          analyze_subdomain() {
-            subdomain="$1"
-            [[ -z "$subdomain" ]] && return
+          # Run httpx with required flags
+          httpx -l subdomains.txt -title -wc -sc -cl -ct -location -web-server -asn -silent -o results/httpx_all.txt
 
-            # Resolve IP
-            ip=$(dig +short "$subdomain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || echo "N/A")
-
-            # ASN lookup
-            if [ "$ip" != "N/A" ]; then
-              asn_data=$(asnmap -ip "$ip" -json -auth "$PDCP_API_KEY" -silent 2>/dev/null || echo "[]")
-              asn=$(echo "$asn_data" | jq -r '.[0].asn // "N/A"')
-              cidr=$(echo "$asn_data" | jq -r '.[0].cidr // "N/A"')
-            else
-              asn="N/A"
-              cidr="N/A"
-            fi
-
-            # CNAME lookup
-            cname=$(dig +short "$subdomain" CNAME | head -n1 || echo "N/A")
-
-            # HTTP status & title
-            http_info=$(httpx -silent -status-code -title -l <(echo "$subdomain") || echo "000|N/A")
-            status_code=$(echo "$http_info" | awk -F '|' '{print $1}')
-            title=$(echo "$http_info" | awk -F '|' '{print $2}')
-
-            # Save results
-            echo "$subdomain,$ip,$asn,$cidr,$cname,$status_code,$title" >> results/final_results.csv
-          }
-
-          export -f analyze_subdomain
-
-          # Run in parallel
-          cat subdomains.txt | parallel -j 20 analyze_subdomain {}
+          # Split results by status codes
+          awk -F '|' '
+          {
+            status = $2
+            if (status >= 200 && status <= 209) print > "results/results_2xx.txt"
+            else if (status >= 300 && status <= 309) print > "results/results_3xx.txt"
+            else if (status == 404) print > "results/results_404.txt"
+            else if (status >= 400 && status <= 409) print > "results/results_4xx.txt"
+          }' results/httpx_all.txt
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: fast-scan-results
-          path: results/final_results.csv
+          name: httpx-scan-results
+          path: results/
