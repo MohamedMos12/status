@@ -1,4 +1,4 @@
-name: "Fast HTTPX Subdomain Scan"
+name: "HTTPX Production Subdomain Scan"
 
 on:
   workflow_dispatch:
@@ -6,48 +6,69 @@ on:
 jobs:
   httpx-scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 55   # حماية من تعليق job
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Install httpx
         run: |
-          sudo apt-get update && sudo apt-get install -y wget unzip
+          sudo apt-get update && sudo apt-get install -y wget unzip jq
 
-          # Install httpx latest release
-          LATEST_HX=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r '.tag_name')
-          VERSION_NUMBER="${LATEST_HX#v}"
-          DOWNLOAD_URL="https://github.com/projectdiscovery/httpx/releases/download/${LATEST_HX}/httpx_${VERSION_NUMBER}_linux_amd64.zip"
-          wget "$DOWNLOAD_URL" -O httpx.zip
+          LATEST=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r '.tag_name')
+          VERSION="${LATEST#v}"
+          URL="https://github.com/projectdiscovery/httpx/releases/download/${LATEST}/httpx_${VERSION}_linux_amd64.zip"
+
+          wget "$URL" -O httpx.zip
           unzip -o httpx.zip
           sudo mv httpx /usr/local/bin/
           sudo chmod +x /usr/local/bin/httpx
           rm httpx.zip
 
-      - name: Run HTTPX Scan
+      - name: Validate input
         run: |
           if [ ! -f subdomains.txt ]; then
-            echo "Error: subdomains.txt not found!"
+            echo "❌ subdomains.txt not found"
             exit 1
           fi
 
-          mkdir -p results
+          echo "📊 Total subdomains:"
+          wc -l subdomains.txt
 
-          # Run httpx with required flags
-          httpx -l subdomains.txt -title -wc -sc -cl -ct -location -web-server -asn -silent -o results/httpx_all.txt
+      - name: Prepare workspace
+        run: |
+          mkdir -p results chunks
+          split -l 5000 subdomains.txt chunks/chunk_
 
-          # Split results by status codes
+      - name: HTTPX Scan (Production)
+        run: |
+          for file in chunks/chunk_*; do
+            echo "🚀 Scanning $file"
+            httpx -l "$file" \
+              -title -wc -sc -cl -ct -location -web-server -asn \
+              -threads 200 \
+              -rate-limit 300 \
+              -timeout 5 \
+              -retries 1 \
+              -no-fallback \
+              -silent \
+              >> results/httpx_all.txt
+          done
+
+      - name: Split Results by Status Code
+        run: |
           awk -F '|' '
           {
-            status = $2
-            if (status >= 200 && status <= 209) print > "results/results_2xx.txt"
-            else if (status >= 300 && status <= 309) print > "results/results_3xx.txt"
-            else if (status == 404) print > "results/results_404.txt"
-            else if (status >= 400 && status <= 409) print > "results/results_4xx.txt"
+            status=$2
+            if (status >= 200 && status <= 209) print > "results/2xx.txt"
+            else if (status >= 300 && status <= 309) print > "results/3xx.txt"
+            else if (status == 404) print > "results/404.txt"
+            else if (status >= 400 && status <= 409) print > "results/4xx.txt"
           }' results/httpx_all.txt
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: httpx-scan-results
+          name: httpx-production-results
           path: results/
